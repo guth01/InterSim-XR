@@ -1,4 +1,4 @@
-# main.py
+# main_mongo.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -7,13 +7,13 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Import the MongoDB interview router
+# Import the MongoDB-based interview router
 from interview_router_mongo import router as interview_router
 
 # Create FastAPI app
 app = FastAPI(
     title="Interview Chatbot API with MongoDB",
-    description="Conversational AI interviewer with audio support and MongoDB integration",
+    description="Conversational AI interviewer with audio support and MongoDB Atlas integration",
     version="2.0.0"
 )
 
@@ -52,9 +52,9 @@ def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app", 
+        "main_mongo:app", 
         host="0.0.0.0", 
         port=8000, 
-        reload=True,  # Enable auto-reload during development
+        reload=True,
         log_level="info"
     )
