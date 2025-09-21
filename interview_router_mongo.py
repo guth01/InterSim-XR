@@ -252,16 +252,31 @@ def get_interview_document(access_code: str) -> dict:
         return None
 
 def update_interview_document(access_code: str, update_data: dict) -> bool:
-    """Update interview document in database or memory"""
+    """Update interview document in database or memory with enhanced error handling"""
     try:
         if mongodb_available:
-            interviews_collection.update_one(
+            print(f"[Storage] Updating MongoDB document {access_code} with: {list(update_data.keys())}")
+            
+            # Use upsert=False to ensure document exists
+            result = interviews_collection.update_one(
                 {"_id": access_code},
-                update_data
+                update_data,
+                upsert=False
             )
+            
+            if result.matched_count == 0:
+                print(f"[Storage] ERROR: No document found with access_code: {access_code}")
+                return False
+            elif result.modified_count == 0:
+                print(f"[Storage] WARNING: Document found but no changes made")
+                return True
+            else:
+                print(f"[Storage] Successfully updated document. Modified: {result.modified_count}")
+                return True
+                
         else:
+            # Memory storage handling (unchanged)
             if access_code in memory_storage:
-                # Handle MongoDB-style updates for memory storage
                 if "$set" in update_data:
                     memory_storage[access_code].update(update_data["$set"])
                 if "$push" in update_data:
@@ -269,11 +284,17 @@ def update_interview_document(access_code: str, update_data: dict) -> bool:
                         if key not in memory_storage[access_code]:
                             memory_storage[access_code][key] = []
                         memory_storage[access_code][key].append(value)
-        return True
+                return True
+            else:
+                print(f"[Storage] ERROR: Document not found in memory: {access_code}")
+                return False
+                
     except Exception as e:
         print(f"[Storage] Error updating document: {e}")
+        import traceback
+        traceback.print_exc()
         return False
-
+    
 def calculate_voice_metrics(transcription_result: str, audio_data: bytes) -> Dict[str, float]:
     """Calculate voice metrics from audio data"""
     try:
@@ -652,6 +673,21 @@ class GeminiClient:
 # Initialize Gemini client
 gemini_client = GeminiClient()
 
+def ensure_serializable_qa_pair(qa_pair: dict) -> dict:
+    """Ensure QA pair is serializable for MongoDB storage"""
+    serializable_qa = qa_pair.copy()
+    
+    # Ensure all voice metrics are float (not numpy types)
+    if "voice_metrics" in serializable_qa:
+        vm = serializable_qa["voice_metrics"]
+        for key, value in vm.items():
+            if hasattr(value, 'item'):  # numpy scalar
+                vm[key] = float(value.item())
+            elif isinstance(value, (int, float)):
+                vm[key] = float(value)
+    
+    return serializable_qa
+
 def generate_confidence_report(qa_pairs: List[Dict], voice_metrics: List[Dict]) -> Dict[str, Any]:
     """Generate confidence report using OpenAI"""
     # Prepare data for analysis
@@ -833,16 +869,7 @@ def answer_question(inp: AnswerQuestionIn):
     audio_bytes = base64.b64decode(inp.audio_data)
     voice_metrics = calculate_voice_metrics(candidate_answer, audio_bytes)
     
-    print("\n------ Voice Metrics ------")
-    print(f"Avg Whisper confidence: {voice_metrics['avg_confidence']:.3f}")
-    print(f"Speech rate (words/sec): {voice_metrics['speech_rate']:.2f}")
-    print(f"Average pause between words (sec): {voice_metrics['avg_pause']:.3f}")
-    print(f"Pitch mean (Hz): {voice_metrics['pitch_mean']:.2f}")
-    print(f"Pitch std (Hz): {voice_metrics['pitch_std']:.2f}")
-    print(f"Energy mean: {voice_metrics['energy_mean']:.2f}")
-    print(f"Energy std: {voice_metrics['energy_std']:.2f}")
-    
-    # Get current question details
+    # Get current question details BEFORE advancing
     current_question, question_number, section, section_name = get_current_question_info(interview_doc)
     
     # Create QA pair with voice metrics and section info
@@ -855,11 +882,25 @@ def answer_question(inp: AnswerQuestionIn):
         "timestamp": datetime.now()
     }
     
-    # Save QA pair
-    update_interview_document(
+    # Ensure data is serializable for MongoDB
+    serializable_qa_pair = ensure_serializable_qa_pair(qa_pair)
+    
+    print(f"[Answer] Storing QA pair for Section {section}, Question {question_number}")
+    
+    # Save QA pair with error checking
+    success = update_interview_document(
         inp.access_code,
-        {"$push": {"qa_pairs": qa_pair}}
+        {"$push": {"qa_pairs": serializable_qa_pair}}
     )
+    
+    if success:
+        print(f"[Answer] Successfully stored QA pair")
+        # Verify it was stored
+        updated_doc = get_interview_document(inp.access_code)
+        qa_count = len(updated_doc.get("qa_pairs", []))
+        print(f"[Answer] Total QA pairs now: {qa_count}")
+    else:
+        print(f"[Answer] WARNING: Failed to store QA pair - continuing interview")
     
     # Advance to next question
     has_more = advance_to_next_question(inp.access_code, interview_doc)
@@ -975,6 +1016,40 @@ def generate_report(inp: GenerateReportIn):
         qa_summary=qa_summary
     )
 
+@router.get("/debug/{access_code}")
+def debug_interview_status(access_code: str):
+    """Debug endpoint to check interview data storage"""
+    interview_doc = get_interview_document(access_code)
+    if not interview_doc:
+        raise HTTPException(status_code=404, detail="Invalid access code")
+    
+    qa_pairs = interview_doc.get("qa_pairs", [])
+    
+    debug_info = {
+        "access_code": access_code,
+        "storage_mode": "MongoDB" if mongodb_available else "Memory",
+        "total_qa_pairs": len(qa_pairs),
+        "interview_complete": interview_doc.get("interview_complete", False),
+        "current_section": interview_doc.get("current_section", 1),
+        "current_question_in_section": interview_doc.get("current_question_in_section", 0),
+        "qa_pairs_by_section": {},
+        "voice_metrics_sample": None
+    }
+    
+    # Group QA pairs by section
+    for section in range(1, 5):
+        section_qa = [qa for qa in qa_pairs if qa.get("section") == section]
+        debug_info["qa_pairs_by_section"][section] = {
+            "count": len(section_qa),
+            "questions": [qa.get("question", "")[:50] + "..." for qa in section_qa]
+        }
+    
+    # Sample voice metrics from first QA pair
+    if qa_pairs:
+        debug_info["voice_metrics_sample"] = qa_pairs[0].get("voice_metrics", {})
+    
+    return debug_info
+
 @router.get("/health")
 def health_check():
     """Health check endpoint"""
@@ -983,6 +1058,24 @@ def health_check():
         "service": "interview-chatbot-mongo",
         "mongodb_connected": mongodb_available,
         "storage_mode": "MongoDB" if mongodb_available else "In-Memory"
+    }
+
+@router.get("/debug/qa-storage/{access_code}")
+def debug_qa_storage(access_code: str):
+    """Debug Q&A storage issues"""
+    doc = get_interview_document(access_code)
+    if not doc:
+        return {"error": "Document not found"}
+    
+    return {
+        "qa_pairs_count": len(doc.get("qa_pairs", [])),
+        "qa_pairs_preview": doc.get("qa_pairs", [])[:2],  # First 2 QA pairs
+        "current_section": doc.get("current_section"),
+        "interview_complete": doc.get("interview_complete"),
+        "section_questions_counts": {
+            section: len(questions) 
+            for section, questions in doc.get("section_questions", {}).items()
+        }
     }
 
 @router.get("/session/{access_code}")
