@@ -118,7 +118,7 @@ class DBManager:
 
 class GeminiClient:
     def __init__(self):
-        self.model = genai.GenerativeModel('gemini-pro')
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
     
     def evaluate_interview(self, job_role: str, qa_pairs: List[Dict]) -> Dict[str, Any]:
         # Prepare transcript for evaluation
