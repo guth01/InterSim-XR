@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-Section API test script for Interview Chatbot endpoints
-Tests the 4-section interview flow without real audio processing (uses mock audio data)
+Tests the 4-section interview flow with proper mock audio data (0.2 seconds of silence)
 """
 
 import requests
@@ -15,7 +15,7 @@ BASE_URL = "http://localhost:8000"
 INTERVIEW_URL = f"{BASE_URL}/interview"
 
 class MultiSectionAPITester:
-    """Tester for the 4-section interview system"""
+    """Tester for the 4-section interview system using valid mock audio data"""
     
     def __init__(self):
         self.session_id = None
@@ -70,25 +70,46 @@ class MultiSectionAPITester:
         """
     
     def create_mock_audio(self) -> str:
-        """Create a minimal valid WAV file as base64"""
-        # Minimal WAV file header (44 bytes) + 1 sample
+        """Create a valid WAV file with sufficient length (0.1+ seconds) as base64"""
+        # Create a WAV file with 0.2 seconds of audio (8820 samples at 44100 Hz)
+        sample_rate = 44100
+        duration_seconds = 0.2
+        num_samples = int(sample_rate * duration_seconds)
+        
+        # WAV header (44 bytes)
         wav_header = bytearray([
             0x52, 0x49, 0x46, 0x46,  # "RIFF"
-            0x2E, 0x00, 0x00, 0x00,  # File size (46 bytes)
+            0x00, 0x00, 0x00, 0x00,  # File size (will be calculated)
             0x57, 0x41, 0x56, 0x45,  # "WAVE"
             0x66, 0x6D, 0x74, 0x20,  # "fmt "
             0x10, 0x00, 0x00, 0x00,  # Subchunk size (16)
             0x01, 0x00,              # Audio format (PCM)
             0x01, 0x00,              # Channels (1)
             0x44, 0xAC, 0x00, 0x00,  # Sample rate (44100)
-            0x88, 0x58, 0x01, 0x00,  # Byte rate
-            0x02, 0x00,              # Block align
+            0x88, 0x58, 0x01, 0x00,  # Byte rate (44100 * 2)
+            0x02, 0x00,              # Block align (2 bytes per sample)
             0x10, 0x00,              # Bits per sample (16)
             0x64, 0x61, 0x74, 0x61,  # "data"
-            0x02, 0x00, 0x00, 0x00,  # Data size (2 bytes)
-            0x00, 0x00               # Sample data
+            0x00, 0x00, 0x00, 0x00,  # Data size (will be calculated)
         ])
-        return base64.b64encode(wav_header).decode('utf-8')
+        
+        # Generate silence (0 values) for the specified duration
+        audio_data = bytearray(num_samples * 2)  # 2 bytes per sample (16-bit)
+        
+        # Calculate and set file sizes
+        data_size = len(audio_data)
+        file_size = 36 + data_size  # Header size (44) - 8 + data size
+        
+        # Update file size in header (bytes 4-7)
+        wav_header[4:8] = file_size.to_bytes(4, 'little')
+        
+        # Update data size in header (bytes 40-43)
+        wav_header[40:44] = data_size.to_bytes(4, 'little')
+        
+        # Combine header and data
+        complete_wav = wav_header + audio_data
+        
+        return base64.b64encode(complete_wav).decode('utf-8')
     
     def get_next_test_answer(self, section: int) -> str:
         """Get the next test answer for the current section"""
@@ -104,7 +125,11 @@ class MultiSectionAPITester:
     
     def test_api_endpoint(self, method: str, endpoint: str, payload: dict = None) -> Dict[str, Any]:
         """Generic API test method"""
-        url = f"{INTERVIEW_URL}{endpoint}"
+        if endpoint.startswith("/session/"):
+            # Handle session endpoints (don't prefix with /interview)
+            url = f"{BASE_URL}/interview{endpoint}"
+        else:
+            url = f"{INTERVIEW_URL}{endpoint}"
         
         try:
             if method.upper() == "GET":
