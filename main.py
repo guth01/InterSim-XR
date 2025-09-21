@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import your interview router
-from interview_router import router as interview_router  # Assuming the previous code is in interview_router.py
+from interview_router2 import router as interview_router  # Assuming the previous code is in interview_router.py
 
 # Create FastAPI app
 app = FastAPI(
