@@ -1,0 +1,7 @@
+# Additional dependencies for full Whisper support
+# Install these only if you have sufficient memory (>1GB RAM available)
+
+# OpenAI Whisper for local speech recognition and confidence scoring
+openai-whisper==20231117
+torch>=2.0.0
+torchaudio>=2.0.0

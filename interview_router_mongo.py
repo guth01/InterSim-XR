@@ -6,6 +6,7 @@ import io
 import json
 import random
 import string
+import gc
 from datetime import datetime
 from openai import OpenAI
 import google.generativeai as genai
@@ -26,14 +27,29 @@ import os
 openai_client = OpenAI()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Load Whisper model once at startup
-print("[Whisper] Loading Whisper model...")
-try:
-    whisper_model = whisper.load_model("base")  # Use 'base' for faster processing, 'medium' for better accuracy
-    print("[Whisper] Model loaded successfully")
-except Exception as e:
-    print(f"[Whisper] Failed to load model: {e}")
-    whisper_model = None
+# Global variable for lazy loading Whisper model
+whisper_model = None
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")  # tiny, base, small, medium, large
+DISABLE_WHISPER = os.getenv("DISABLE_WHISPER", "false").lower() == "true"
+
+def load_whisper_model():
+    """Lazy load Whisper model only when needed"""
+    global whisper_model
+    
+    if DISABLE_WHISPER:
+        print("[Whisper] Whisper disabled via environment variable")
+        return None
+        
+    if whisper_model is None:
+        try:
+            print(f"[Whisper] Loading Whisper model ({WHISPER_MODEL_SIZE})...")
+            whisper_model = whisper.load_model(WHISPER_MODEL_SIZE)
+            print("[Whisper] Model loaded successfully!")
+        except Exception as e:
+            print(f"[Whisper] Failed to load model: {e}")
+            whisper_model = False  # Mark as failed to avoid repeated attempts
+    
+    return whisper_model if whisper_model is not False else None
 
 router = APIRouter(prefix="/interview", tags=["interview"])
 
@@ -329,6 +345,7 @@ def calculate_voice_metrics(transcription_result: str, audio_data: bytes) -> Dic
         }
         
         # Use Whisper for confidence calculation if available
+        whisper_model = load_whisper_model()
         if whisper_model is not None:
             try:
                 print("[Voice Metrics] Using Whisper for confidence calculation...")
@@ -444,6 +461,9 @@ def calculate_voice_metrics(transcription_result: str, audio_data: bytes) -> Dic
         except:
             pass
         
+        # Force garbage collection to free memory
+        gc.collect()
+        
         # Ensure all values are within reasonable ranges
         metrics["avg_confidence"] = max(0.0, min(1.0, metrics["avg_confidence"]))
         metrics["speech_rate"] = max(0.0, min(10.0, metrics["speech_rate"]))
@@ -458,6 +478,9 @@ def calculate_voice_metrics(transcription_result: str, audio_data: bytes) -> Dic
     except Exception as e:
         print(f"[Voice Metrics] Error calculating metrics: {e}")
         traceback.print_exc()
+        
+        # Force garbage collection even on error
+        gc.collect()
         
         # Return safe default values if everything fails
         return {
