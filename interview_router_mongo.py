@@ -17,10 +17,23 @@ from scipy import signal
 from pymongo import MongoClient
 from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
+import whisper
+import tempfile
+import traceback
+import os
 
 # Initialize clients
 openai_client = OpenAI()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Load Whisper model once at startup
+print("[Whisper] Loading Whisper model...")
+try:
+    whisper_model = whisper.load_model("base")  # Use 'base' for faster processing, 'medium' for better accuracy
+    print("[Whisper] Model loaded successfully")
+except Exception as e:
+    print(f"[Whisper] Failed to load model: {e}")
+    whisper_model = None
 
 router = APIRouter(prefix="/interview", tags=["interview"])
 
@@ -294,77 +307,167 @@ def update_interview_document(access_code: str, update_data: dict) -> bool:
         import traceback
         traceback.print_exc()
         return False
-    
+
+
 def calculate_voice_metrics(transcription_result: str, audio_data: bytes) -> Dict[str, float]:
-    """Calculate voice metrics from audio data"""
+    """Calculate voice metrics from audio data using Whisper for confidence"""
     try:
-        # Convert audio bytes to numpy array
-        audio_io = io.BytesIO(audio_data)
-        audio_array, sample_rate = librosa.load(audio_io, sr=None)
+        # Save audio bytes to temporary file for Whisper processing
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+            temp_audio.write(audio_data)
+            temp_audio_path = temp_audio.name
         
-        # Calculate speech rate (words per second)
-        word_count = len(transcription_result.split())
-        duration = len(audio_array) / sample_rate
-        speech_rate = word_count / duration if duration > 0 else 0
-        
-        # Calculate energy features
-        energy = np.sum(audio_array ** 2)
-        energy_mean = np.mean(energy) if len(audio_array) > 0 else 0
-        energy_std = np.std(energy) if len(audio_array) > 0 else 0
-        
-        # Calculate pitch features using autocorrelation
-        pitch_values = []
-        frame_length = int(0.025 * sample_rate)  # 25ms frames
-        hop_length = int(0.010 * sample_rate)    # 10ms hop
-        
-        for i in range(0, len(audio_array) - frame_length, hop_length):
-            frame = audio_array[i:i + frame_length]
-            if len(frame) == frame_length:
-                # Simple pitch estimation using autocorrelation
-                autocorr = np.correlate(frame, frame, mode='full')
-                autocorr = autocorr[len(autocorr)//2:]
-                
-                # Find fundamental frequency
-                if len(autocorr) > 1:
-                    peak_idx = np.argmax(autocorr[1:]) + 1
-                    if peak_idx > 0:
-                        pitch = sample_rate / peak_idx
-                        if 50 <= pitch <= 500:  # Human speech range
-                            pitch_values.append(pitch)
-        
-        pitch_mean = np.mean(pitch_values) if pitch_values else 0
-        pitch_std = np.std(pitch_values) if pitch_values else 0
-        
-        # Calculate average pause (simplified)
-        # Detect silence frames (low energy)
-        silence_threshold = np.mean(audio_array ** 2) * 0.1
-        silence_frames = np.where(audio_array ** 2 < silence_threshold)[0]
-        avg_pause = len(silence_frames) / sample_rate if len(silence_frames) > 0 else 0
-        
-        # Mock confidence score (in real scenario, this would come from Whisper API)
-        avg_confidence = random.uniform(0.7, 0.95)
-        
-        return {
-            "avg_confidence": avg_confidence,
-            "speech_rate": speech_rate,
-            "avg_pause": avg_pause,
-            "pitch_mean": pitch_mean,
-            "pitch_std": pitch_std,
-            "energy_mean": energy_mean,
-            "energy_std": energy_std
-        }
-        
-    except Exception as e:
-        print(f"[Voice Metrics] Error calculating metrics: {e}")
-        # Return default values if calculation fails
-        return {
-            "avg_confidence": 0.8,
+        # Initialize default metrics
+        metrics = {
+            "avg_confidence": 0.8,  # fallback
             "speech_rate": 2.0,
             "avg_pause": 0.2,
             "pitch_mean": 150.0,
             "pitch_std": 20.0,
             "energy_mean": 0.5,
             "energy_std": 0.1
+        }
+        
+        # Use Whisper for confidence calculation if available
+        if whisper_model is not None:
+            try:
+                print("[Voice Metrics] Using Whisper for confidence calculation...")
+                
+                # Transcribe with word-level timestamps and confidence
+                result = whisper_model.transcribe(
+                    temp_audio_path, 
+                    word_timestamps=True,
+                    verbose=False
+                )
+                
+                # Extract confidence from Whisper segments
+                word_confidences = []
+                word_times = []
+                
+                for segment in result.get('segments', []):
+                    # Segment-level confidence from avg_logprob
+                    if 'avg_logprob' in segment:
+                        segment_confidence = np.exp(segment['avg_logprob'])
+                        word_confidences.append(segment_confidence)
+                    
+                    # Extract word-level timing for pause calculation
+                    for word in segment.get('words', []):
+                        if 'start' in word and 'end' in word:
+                            word_times.append((float(word['start']), float(word['end'])))
+                        
+                        # Word-level confidence if available
+                        if 'probability' in word:
+                            word_confidences.append(float(word['probability']))
+                        elif 'avg_logprob' in word:
+                            word_confidence = np.exp(word['avg_logprob'])
+                            word_confidences.append(word_confidence)
+                
+                # Calculate average confidence
+                if word_confidences:
+                    metrics["avg_confidence"] = float(np.mean(word_confidences))
+                    print(f"[Voice Metrics] Whisper confidence: {metrics['avg_confidence']:.3f}")
+                
+                # Calculate speech rate from Whisper timing
+                if result.get('segments'):
+                    total_words = sum(len(seg.get('words', [])) for seg in result['segments'])
+                    if total_words > 0:
+                        first_start = float(result['segments'][0].get('start', 0))
+                        last_end = float(result['segments'][-1].get('end', 0))
+                        total_duration = last_end - first_start
+                        
+                        if total_duration > 0:
+                            metrics["speech_rate"] = total_words / total_duration
+                
+                # Calculate pause duration between words
+                if len(word_times) > 1:
+                    pauses = []
+                    for i in range(len(word_times) - 1):
+                        pause_duration = word_times[i + 1][0] - word_times[i][1]
+                        if pause_duration > 0:  # Only positive pauses
+                            pauses.append(pause_duration)
+                    
+                    if pauses:
+                        metrics["avg_pause"] = float(np.mean(pauses))
+                
+                print(f"[Voice Metrics] Whisper speech rate: {metrics['speech_rate']:.2f} words/sec")
+                print(f"[Voice Metrics] Whisper avg pause: {metrics['avg_pause']:.3f} sec")
+                
+            except Exception as e:
+                print(f"[Voice Metrics] Whisper processing failed: {e}")
+                # Continue with librosa processing for other metrics
+        
+        # Use librosa for additional audio features
+        try:
+            audio_io = io.BytesIO(audio_data)
+            audio_array, sample_rate = librosa.load(audio_io, sr=None)
+            
+            # Calculate energy features
+            frame_length = 2048
+            hop_length = 512
+            energy = np.array([
+                sum(abs(audio_array[i:i+frame_length]**2)) 
+                for i in range(0, len(audio_array), hop_length)
+            ])
+            
+            if len(energy) > 0:
+                metrics["energy_mean"] = float(np.mean(energy))
+                metrics["energy_std"] = float(np.std(energy))
+            
+            # Calculate pitch features using librosa
+            try:
+                fmin = librosa.note_to_hz('C2')  # ~65 Hz
+                fmax = librosa.note_to_hz('C7')  # ~2093 Hz
+                f0, voiced_flag, voiced_probs = librosa.pyin(
+                    audio_array, 
+                    fmin=fmin, 
+                    fmax=fmax, 
+                    sr=sample_rate
+                )
+                
+                # Filter out NaN values and extract valid pitch values
+                valid_f0 = f0[~np.isnan(f0)]
+                if len(valid_f0) > 0:
+                    metrics["pitch_mean"] = float(np.mean(valid_f0))
+                    metrics["pitch_std"] = float(np.std(valid_f0))
+                
+            except Exception as e:
+                print(f"[Voice Metrics] Pitch calculation failed: {e}")
+                # Keep default pitch values
+            
+        except Exception as e:
+            print(f"[Voice Metrics] Librosa processing failed: {e}")
+            # Keep default values
+        
+        # Clean up temporary file
+        try:
+            os.unlink(temp_audio_path)
+        except:
+            pass
+        
+        # Ensure all values are within reasonable ranges
+        metrics["avg_confidence"] = max(0.0, min(1.0, metrics["avg_confidence"]))
+        metrics["speech_rate"] = max(0.0, min(10.0, metrics["speech_rate"]))
+        metrics["avg_pause"] = max(0.0, min(5.0, metrics["avg_pause"]))
+        metrics["pitch_mean"] = max(50.0, min(500.0, metrics["pitch_mean"]))
+        
+        print(f"[Voice Metrics] Final metrics: confidence={metrics['avg_confidence']:.3f}, "
+                f"speech_rate={metrics['speech_rate']:.2f}, pause={metrics['avg_pause']:.3f}")
+        
+        return metrics
+        
+    except Exception as e:
+        print(f"[Voice Metrics] Error calculating metrics: {e}")
+        traceback.print_exc()
+        
+        # Return safe default values if everything fails
+        return {
+            "avg_confidence": 0.7,
+            "speech_rate": 2.0,
+            "avg_pause": 0.3,
+            "pitch_mean": 150.0,
+            "pitch_std": 25.0,
+            "energy_mean": 0.4,
+            "energy_std": 0.15
         }
 
 def transcribe_audio(base64_audio_data: str) -> str:
@@ -399,19 +502,19 @@ def text_to_speech(text: str) -> str:
         print(f"[TTS] Text-to-speech error: {e}")
         raise HTTPException(status_code=500, detail=f"Text-to-speech failed: {e}")
 
-def generate_initial_questions(job_role: str, job_description: Optional[str] = None) -> List[str]:
-    """Returns hardcoded interview questions (no LLM generation for reliable testing)"""
-    print(f"[Questions] Using hardcoded questions for {job_role}")
+# def generate_initial_questions(job_role: str, job_description: Optional[str] = None) -> List[str]:
+#     """Returns hardcoded interview questions (no LLM generation for reliable testing)"""
+#     print(f"[Questions] Using hardcoded questions for {job_role}")
     
-    # Always return the same 6 questions for consistent testing
-    return [
-        f"Could you start by telling me about yourself and what interests you about the {job_role} role?",
-        "Can you walk me through a challenging technical project you've worked on recently?",
-        "How do you approach problem-solving when faced with a technical issue you haven't encountered before?",
-        "What tools and technologies are you most comfortable working with, and why?",
-        "Can you describe a time when you had to learn a new technology or skill quickly?",
-        "What do you see as the biggest challenges in the field right now, and how do you stay current?"
-    ]
+#     # Always return the same 6 questions for consistent testing
+#     return [
+#         f"Could you start by telling me about yourself and what interests you about the {job_role} role?",
+#         "Can you walk me through a challenging technical project you've worked on recently?",
+#         "How do you approach problem-solving when faced with a technical issue you haven't encountered before?",
+#         "What tools and technologies are you most comfortable working with, and why?",
+#         "Can you describe a time when you had to learn a new technology or skill quickly?",
+#         "What do you see as the biggest challenges in the field right now, and how do you stay current?"
+#     ]
 
 def generate_all_section_questions(job_role: str, job_description: Optional[str] = None, resume_text: Optional[str] = None) -> Dict[str, List[str]]:
     """Generate questions for all sections at session creation"""
